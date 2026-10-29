@@ -1,4 +1,5 @@
 import logging
+import os
 
 import numpy as np
 import torch 
@@ -66,6 +67,18 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
     
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
     ctc = prepare_matching(ops, U)
+    matcher = None
+    backend = os.environ.get('KS4_MATCHING_BACKEND', 'auto')
+    if backend not in ('auto', 'torch', 'triton'):
+        raise ValueError('KS4_MATCHING_BACKEND must be auto, torch, or triton')
+    if U.is_cuda and backend != 'torch':
+        from kilosort.matching import TemplateMatcher, kernels
+        if kernels.AVAILABLE and hasattr(torch, 'nonzero_static'):
+            matcher = TemplateMatcher(ops, U, ctc)
+            del ctc
+            logger.info('Using sparse Triton matching with reusable CUDA graphs')
+        elif backend == 'triton':
+            raise RuntimeError('Triton matching requires Triton and torch.nonzero_static')
     st = np.zeros((10**6, 3), 'float64')
     tF  = torch.zeros((10**6, nC , ops['settings']['n_pcs']))
     k = 0
@@ -81,7 +94,14 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
                 log_performance(logger, 'debug', f'Batch {ibatch}')
 
             X = bfile.padded_batch_to_torch(ibatch, ops)
-            stt, amps, th_amps, Xres = run_matching(ops, X, U, ctc, device=device)
+            if matcher is None:
+                stt, amps, th_amps, Xres = run_matching(ops, X, U, ctc, device=device)
+            else:
+                matches = matcher.match(X)
+                stt = torch.stack((matches.sample_indices, matches.template_indices), dim=1)
+                amps = matches.amplitudes[:, None]
+                th_amps = matches.scores[:, None]
+                Xres = matches.residual
             xfeat = Xres[iCC[:, iU[stt[:,1:2]]],stt[:,:1] + tiwave] @ ops['wPCA'].T
             xfeat += amps * Ucc[:,stt[:,1]]
 
@@ -116,6 +136,10 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
         logger.debug(f'X shape: {X.shape}')
         logger.debug(f'stt shape: {stt.shape}')
         raise
+    finally:
+        if matcher is not None:
+            ops['matching_stats'] = matcher.statistics.copy()
+            matcher.close()
 
     log_performance(logger, 'debug', f'Batch {ibatch}')
 
@@ -263,6 +287,7 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
         is_ref, est_contam_rate = CCG.refract(clu, st[:,0]/ops['fs'],
                                               acg_threshold=acg_threshold,
                                               ccg_threshold=ccg_threshold)
+        spike_trains = CCG.group_spike_times(clu2, st[:, 0])
 
     nt = ops['nt']
     W = ops['wPCA'].contiguous()
@@ -294,19 +319,25 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
         cmax, imax = ctc.max(1)
         cmax[kk] = 0
 
-        jsort = np.argsort(cmax.cpu().numpy())[::-1]
+        # Sorting already transfers every score to the host. Reuse that exact
+        # copy for threshold checks instead of launching a CUDA scalar compare
+        # and synchronizing for every candidate. Cast as PyTorch would, so
+        # thresholds between adjacent representable scores retain their meaning.
+        cmax_cpu = cmax.cpu().numpy()
+        r_thresh_cpu = cmax_cpu.dtype.type(r_thresh)
+        jsort = np.argsort(cmax_cpu)[::-1]
 
         if mode == 'ccg':
-            st0 = st[:,0][clu2==kk] / ops['fs']
+            st0 = spike_trains[kk] / ops['fs']
         
         is_ccg  = 0
         for j in range(NN):
             jj = jsort[j]
-            if cmax[jj] < r_thresh:
+            if cmax_cpu[jj] < r_thresh_cpu:
                 break
             # compare with CCG
             if mode == 'ccg':
-                st1 = st[:,0][clu2==jj] / ops['fs']
+                st1 = spike_trains[jj] / ops['fs']
                 _, is_ccg, _ = CCG.check_CCG(st0, st1, acg_threshold=acg_threshold,
                                              ccg_threshold=ccg_threshold)        
             else:
@@ -323,6 +354,10 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                     tF, Wall = roll_features(W, tF, Ww, idx, jj, dt)
                     # Shift spike times
                     st[idx,0] -= dt
+                if mode == 'ccg':
+                    shifted = spike_trains[jj] - dt if check_dt else spike_trains[jj]
+                    spike_trains[kk] = np.concatenate((spike_trains[kk], shifted))
+                    spike_trains[jj] = np.empty(0, dtype=st.dtype)
                 
                 Ww[kk] = ns[kk]/(ns[kk]+ns[jj]) * Ww[kk] + ns[jj]/(ns[kk]+ns[jj]) * Ww[jj]            
                 Ww[jj] = 0
@@ -359,6 +394,14 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
 
 
 def roll_features(wPCA, tF, Wall, spike_idx, clust_idx, dt):
+    # NumPy boolean arrays otherwise pass through PyTorch's sequence-index
+    # conversion on both the read and write of the full recording. Resolve
+    # membership once, then reuse a native integer index for the selected rows.
+    if isinstance(spike_idx, np.ndarray):
+        indices = np.flatnonzero(spike_idx) if spike_idx.dtype == np.bool_ else spike_idx
+        spike_idx = torch.as_tensor(indices, device=tF.device)
+    elif isinstance(spike_idx, torch.Tensor) and spike_idx.dtype == torch.bool:
+        spike_idx = torch.nonzero(spike_idx, as_tuple=True)[0]
     W = wPCA.cpu()
     # Project from PC space back to sample time, shift by dt
     feats = torch.roll(tF[spike_idx] @ W, shifts=dt, dims=2)

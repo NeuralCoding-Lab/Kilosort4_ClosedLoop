@@ -101,6 +101,24 @@ def similarity(Wall, W, nt=61):
     similar_templates = similar_templates.max(axis=-1)
     return similar_templates
 
+def group_spike_times(labels, times):
+    """Group once, preserving within-unit order and empty cluster IDs.
+
+    This avoids a full-recording boolean scan for each repeated CCG lookup.
+    Returned arrays do not alias the caller's spike-time array.
+    """
+    labels, times = np.asarray(labels), np.asarray(times)
+    if labels.size == 0:
+        return []
+    order = np.argsort(labels, kind='stable')
+    sorted_times = times[order]
+    ids, starts, counts = np.unique(labels[order], return_index=True, return_counts=True)
+    groups = [np.empty(0, dtype=times.dtype) for _ in range(int(labels.max()) + 1)]
+    for unit, start, count in zip(ids, starts, counts):
+        groups[int(unit)] = sorted_times[start:start+count]
+    return groups
+
+
 def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
     
     Nfilt = iclust2.max()+1
@@ -109,9 +127,9 @@ def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
     cross_refractory = np.zeros(Nfilt, )
     R12 = np.zeros(Nfilt, )
 
-    for kk in range(Nfilt):    
-        ix = iclust2==kk
-        st1 = st0[ix]
+    trains = group_spike_times(iclust2, st0)
+    for kk in range(Nfilt):
+        st1 = trains[kk]
 
         if (len(st1) > 10) and ((st1.max() - st1.min()) != 0):
             is_refractory[kk], cross_refractory[kk], R12[kk] = check_CCG(

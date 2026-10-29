@@ -242,6 +242,17 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     weigh = torch.permute(weigh, (2, 0, 1)).contiguous()
     weigh = weigh / (weigh**2).sum(1).unsqueeze(1)**.5
 
+    detector = None
+    backend = os.environ.get('KS4_DETECTION_BACKEND', 'auto').lower()
+    if backend not in ('auto', 'torch', 'triton'):
+        raise ValueError('KS4_DETECTION_BACKEND must be auto, torch or triton')
+    if backend != 'torch' and torch.device(device).type == 'cuda':
+        from kilosort.detection import UniversalDetector, kernels
+        if kernels.AVAILABLE:
+            detector = UniversalDetector(ops, iC, iC2, weigh)
+        elif backend == 'triton':
+            raise RuntimeError('Triton is required for KS4_DETECTION_BACKEND=triton')
+
     st = np.zeros((10**6, 6), 'float64')
     tF = np.zeros((10**6, nC , ops['settings']['n_pcs']), 'float32')
 
@@ -259,7 +270,10 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
                 log_performance(logger, 'debug', f'Batch {ibatch} of {nb-1} ({100*(ibatch/nb):.1f}%)')
 
             X = bfile.padded_batch_to_torch(ibatch, ops)
-            xy, imax, amp, adist = template_match(X, ops, iC, iC2, weigh, device=device)
+            if detector is None:
+                xy, imax, amp, adist = template_match(X, ops, iC, iC2, weigh, device=device)
+            else:
+                xy, imax, amp, adist = detector.match(X)
             yct = yweighted(yc, iC, adist, xy, device=device)
             nsp = len(xy)
 
@@ -304,4 +318,6 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     ops['iC'] = iC
     ops['iC2'] = iC2
     ops['weigh'] = weigh
+    if detector is not None:
+        ops['universal_detection_stats'] = detector.statistics.copy()
     return st, tF, ops

@@ -27,13 +27,21 @@ def bin_spikes(ops, st):
     Nbatches = ops['Nbatches']
     
     batch_id = st[:,4].copy()
+    # Detection emits batches contiguously. Locate each block once instead of
+    # scanning all spikes for each batch. Preserve input order even for callers
+    # supplying an unsorted table, and ignore out-of-range IDs as before.
+    order = None
+    if np.any(batch_id[1:] < batch_id[:-1]) or np.any(~np.isfinite(batch_id)):
+        order = np.argsort(batch_id, kind='stable')
+        batch_id = batch_id[order]
+    starts = np.searchsorted(batch_id, np.arange(Nbatches), side='left')
+    ends = np.searchsorted(batch_id, np.arange(Nbatches), side='right')
 
     # always use 20 bins for amplitude binning
     F = np.zeros((Nbatches, dmax, 20))
     for t in range(ops['Nbatches']):
         # consider only spikes from this batch
-        ix = (batch_id==t).nonzero()[0]
-        sst = st[ix]
+        sst = st[starts[t]:ends[t]] if order is None else st[order[starts[t]:ends[t]]]
 
         # their depth relative to the minimum
         dep = sst[:,1] - dmin
@@ -51,7 +59,7 @@ def bin_spikes(ops, st):
         cols = (1e-5 + amp * 20).astype('int32')
 
         # for efficient binning, use sparse matrix computation in scipy
-        cou = np.ones(len(ix))
+        cou = np.ones(len(sst))
         M = coo_matrix((cou, (rows, cols)), (dmax, 20))
 
         # the 2D histogram counts are transformed to logarithm
@@ -70,6 +78,7 @@ def align_block2(F, ysamp, ops, device=torch.device('cuda')):
     # n is the maximum vertical shift allowed, in units of bins
     n = 15
     dc = np.zeros((2*n+1, Nbatches))
+    dc_gpu = torch.empty((2*n+1, Nbatches), device=device)
     dt = np.arange(-n,n+1,1)
 
     # batch fingerprints are mean subtracted along depth
@@ -88,7 +97,8 @@ def align_block2(F, ysamp, ops, device=torch.device('cuda')):
         # for each vertical shift in the range -n to n, compute the dot product
         for t in range(len(dt)):
             Fs = torch.roll(Fg, dt[t], 1)
-            dc[t] = (Fs * F0).mean(-1).mean(-1).cpu().numpy()
+            dc_gpu[t] = (Fs * F0).mean(-1).mean(-1)
+        dc[:] = dc_gpu.cpu().numpy()
 
         # for all but the last iteration, align the batches 
         if iter<niter-1:
@@ -122,6 +132,7 @@ def align_block2(F, ysamp, ops, device=torch.device('cuda')):
     n  = 5
     dt = np.arange(-n, n+1, 1)
     dcs = np.zeros((2*n+1, Nbatches, nblocks))
+    dcs_gpu = torch.empty((2*n+1, Nbatches, nblocks), device=device)
 
     # for each block in each batch, recompute the dot products with the template
     for j in range(nblocks):
@@ -132,7 +143,8 @@ def align_block2(F, ysamp, ops, device=torch.device('cuda')):
 
         for t in range(len(dt)):
             Fs = torch.roll(Fsub, dt[t], 1)
-            dcs[t, :, j] = (Fs * F0[isub]).mean(-1).mean(-1).cpu().numpy()
+            dcs_gpu[t, :, j] = (Fs * F0[isub]).mean(-1).mean(-1)
+    dcs[:] = dcs_gpu.cpu().numpy()
 
     # upsamples the dot-product matrices by 10 to get finer estimates of vertica ldrift
     dtup = np.linspace(-n,n,2*n*10+1)
