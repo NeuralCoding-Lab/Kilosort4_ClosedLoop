@@ -1,0 +1,56 @@
+
+[build-system]
+requires = [
+    "setuptools>=61",
+    "setuptools-scm",
+    "pytest-runner",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kilosort"
+requires-python = ">=3.12"
+dynamic = [
+    "version",
+    "description",
+    "readme",
+    "license",
+    "authors",
+    "classifiers",
+    "urls",
+    "dependencies",
+    "optional-dependencies",
+]
+[dependency-groups]
+dev = [
+    "ipykernel",
+    "ipywidgets",
+    "pytest",
+]
+
+# Pin versions shared with the other project
+[tool.uv]
+constraint-dependencies = [
+    "numpy==2.4.3",
+    "scipy==1.17.1",
+    "torch==2.14.1",
+]
+
+# PyTorch CUDA 12.6
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+# Package indexes
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

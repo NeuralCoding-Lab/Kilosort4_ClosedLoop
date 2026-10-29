@@ -90,6 +90,10 @@ setup(
         'docs': docs_deps,
         'gui': gui_deps,
         'all': gui_deps,
+        'acceleration': [
+            "triton-windows; sys_platform == 'win32'",
+            "triton; sys_platform == 'linux'",
+        ],
     },
     include_package_data=True,
     classifiers=[
