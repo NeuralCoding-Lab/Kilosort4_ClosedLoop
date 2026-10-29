@@ -26,10 +26,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('root', type=Path)
     parser.add_argument('--limit', type=int)
+    parser.add_argument('--baseline', type=Path, help='Frozen before source directory')
     args = parser.parse_args()
     root = args.root
     torch.set_num_threads(16)
-    spec = importlib.util.spec_from_file_location('frozen_datashift', root / 'baseline/kilosort/datashift.py')
+    spec = importlib.util.spec_from_file_location('frozen_datashift', (args.baseline or root / 'baseline') / 'kilosort/datashift.py')
     frozen = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(frozen)
     reports = []

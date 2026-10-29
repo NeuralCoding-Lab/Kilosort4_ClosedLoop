@@ -6,6 +6,7 @@ import ctypes
 import functools
 import hashlib
 import importlib
+from importlib.metadata import version, PackageNotFoundError
 import json
 import os
 from pathlib import Path
@@ -103,6 +104,8 @@ def main():
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--data', type=Path, default=Path('F:/kilosort_simu/25298815/sim_no_drift_30min'))
+    parser.add_argument('--config', type=Path)
+    parser.add_argument('--probe', choices=['ProbeA', 'ProbeB'])
     parser.add_argument('--tmax', type=float)
     parser.add_argument('--threads', type=int, default=16)
     parser.add_argument('--checkpoint', action='store_true')
@@ -110,16 +113,41 @@ def main():
     parser.add_argument('--profile-merge', action='store_true')
     parser.add_argument('--profile-detection', action='store_true')
     args = parser.parse_args()
+    if args.config and not args.probe:
+        parser.error('--config requires --probe')
     args.output.mkdir(parents=True, exist_ok=False)
     sys.path.insert(0, str(args.source.resolve()))
     ks = importlib.import_module('kilosort.run_kilosort')
+    if not Path(ks.__file__).resolve().is_relative_to(args.source.resolve()):
+        raise RuntimeError('Loaded kilosort outside requested source directory')
     from kilosort import io, template_matching, spikedetect, clustering_qr
     torch.set_num_threads(args.threads)
     torch.cuda.init()
-    settings = json.loads((args.data / 'ks4_settings.json').read_text())
+    config = json.loads(args.config.read_text(encoding='utf-8')) if args.config else None
+    if config:
+        settings = dict(config['settings'])
+        filename = Path(config['recording_directory']) / 'continuous' / config['streams'][args.probe] / 'continuous.dat'
+        run_options = dict(config['run_options'])
+    else:
+        settings = json.loads((args.data / 'ks4_settings.json').read_text())
+        filename = args.data / 'sim.imec0.ap.bin'
+        run_options = dict(probe=io.load_probe(args.data / 'probe.json'))
+    if not filename.is_file():
+        raise FileNotFoundError(filename)
     if args.tmax is not None:
         settings['tmax'] = args.tmax
+    packages = {}
+    for name in ('triton-windows', 'triton', 'numpy', 'scipy'):
+        try:
+            packages[name] = version(name)
+        except PackageNotFoundError:
+            packages[name] = None
     metadata = dict(source=str(args.source.resolve()), kilosort_module=ks.__file__,
+        packages=packages,
+        instrumentation=dict(checkpoint=args.checkpoint, merge_checkpoint=args.merge_checkpoint,
+                             profile_merge=args.profile_merge, profile_detection=args.profile_detection),
+        filename=str(filename), run_options=run_options if config else {},
+        requested_backends={k: os.environ.get(k, 'auto') for k in ('KS4_MATCHING_BACKEND', 'KS4_DETECTION_BACKEND')},
         python=sys.executable, torch=torch.__version__, cuda=torch.version.cuda,
         gpu=torch.cuda.get_device_name(), settings=settings, threads=args.threads,
         platform=platform.platform(), cpu=platform.processor(), logical_cpus=psutil.cpu_count(),
@@ -211,14 +239,16 @@ def main():
     started = time.perf_counter()
     status = {}
     try:
-        result = ks.run_kilosort(settings=settings, probe=io.load_probe(args.data / 'probe.json'),
-            filename=args.data / 'sim.imec0.ap.bin', results_dir=args.output / 'sorting',
+        result = ks.run_kilosort(settings=settings, **run_options,
+            filename=filename, results_dir=args.output / 'sorting',
             data_dtype='int16', device=torch.device('cuda'), torch_thread_lim=args.threads)
         ops, st, clu, tF, Wall, similar, is_ref, contamination, kept = result
         status = dict(success=True, spikes=int(kept.sum()), units=int(len(np.unique(clu))),
             good_units=int(is_ref.sum()), runtimes={k: v for k, v in ops.items() if k.startswith('runtime')},
             matching_stats=ops.get('matching_stats'),
             universal_detection_stats=ops.get('universal_detection_stats'))
+        (args.output / 'effective_settings.json').write_text(
+            json.dumps(ops['settings'], indent=2, default=str), encoding='utf-8')
     except BaseException:
         status = dict(success=False, error=traceback.format_exc())
         raise

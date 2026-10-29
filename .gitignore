@@ -136,3 +136,6 @@ tests/.test_data/*
 
 # docs/ copy of README
 docs/README.md
+# Local benchmark sources and outputs
+benchmarks/results/
+benchmarks/.sources/

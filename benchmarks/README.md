@@ -1,3 +1,61 @@
+# Real recording comparison
+
+Use the project `.venv` on both variants (`uv sync --locked --extra acceleration`).
+The experiment config is `configs/260628_260409A05_recording1.json`. It mirrors
+`ClosedLoopValidation_pipeline/ExpScripts/config/sorting_config.py`: 384 stored
+channels, 30 kHz, nblocks=1, NeuroPix1_default.mat, 160 selected channels,
+extra-variable export enabled. The original recording is read directly.
+The probe map must be available to Kilosort and match the recording geometry.
+
+Plan only (no sorting, GPU kernels, source export or output creation):
+
+```powershell
+.\.venv\Scripts\python.exe benchmarks/run_comparison.py --probe ProbeA --output benchmarks/results/probeA_smoke --tmax 60 --repeats 1
+```
+
+Add `--execute` only when ready to run. Omit `--tmax` for the complete recording.
+Use a new output path for each experiment and `--probe ProbeB` for the second probe.
+The default two repetitions alternate before/after order; increase `--repeats`
+for more repetitions. Each repetition has its own report, not a pooled speedup.
+A short smoke test validates execution, not full-recording speed or accuracy.
+
+The runner freezes before at the config's baseline commit (13b5388) and after
+at HEAD. Commit sorting/environment edits first. It launches the same Python in
+fresh sequential processes, forces Torch for before and Triton for after, and
+stops on failure. Logs, source snapshots and plan.json remain under the output.
+Results are organized as ProbeA/repeat_01/{before,after}. Source snapshots are
+baseline/ and accelerated/ at the experiment root. Each run records source
+hashes, requested/effective settings, dependency versions and backend statistics.
+No disk cache is cleared: first-call compilation can affect timing. Compare
+repetitions individually, and distinguish first-call cost from warmed runs.
+
+Clean timing leaves checkpoint and profiling disabled. For separate validation,
+use a different output path and `--validation --repeats 1 --execute`. This saves
+matching, merge and detection inputs/outputs; it can consume substantial disk
+space. Do not mix those timings into clean benchmark results.
+
+For that validation run, pass its ProbeA/repeat_01 directory to
+`replay_matching.py`; pass its before/matching_input.pt to `validate_matching.py`.
+`replay_detection.py` also needs `--baseline <experiment>/baseline`.
+Run `replay_merge.py` twice with `--source <experiment>/baseline` and
+`--source <experiment>/accelerated`, the same `--checkpoint
+<experiment>/ProbeA/repeat_01/before/merge_input.pt`, and separate `--output`
+directories. Replay scripts must come from the matching accelerated revision.
+They currently use 16 CPU threads, matching this experiment config.
+
+Real recordings here have no ground truth. Do not run the simulation-specific
+`evaluate_ks4.py` or interpret event agreement as biological accuracy. Reports
+contain measured timing/hardware and output counts, with no inherited claims
+that historical tests passed. GPU telemetry covers the whole device; close
+competing workloads. Sorting end-to-end includes export and plots but excludes
+Python startup/imports. NVML and CUDA device 0 are assumed; use this runner on
+the current single-GPU setup without GPU-remapping environment variables.
+
+---
+
+The following collaborator notes describe historical simulation experiments;
+their paths, hardware, results and report scripts are not current measurements.
+
 # KS4 matching acceleration
 
 The learned-template extraction uses the optional Triton backend on CUDA when
